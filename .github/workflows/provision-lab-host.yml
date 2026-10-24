@@ -20,7 +20,6 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -q
-          # MATE desktop is extremely stable with xrdp and avoids xfconf/dbus session loops
           sudo apt-get install -yq --no-install-recommends \
             mate-desktop-environment mate-core mate-terminal xorg xorgxrdp xrdp dbus-x11 ssl-cert
           
@@ -29,12 +28,17 @@ jobs:
 
       - name: Create RDP user and set password
         run: |
-          # Create user 'rdp' if not exists
+          # Create user 'rdp' with home directory if not exists
           sudo useradd -m -s /bin/bash rdp || true
           sudo usermod -aG sudo rdp
           
           # Set password to 1234
           echo "rdp:1234" | sudo chpasswd
+          
+          # Fix home directory ownership and permissions completely for 'rdp'
+          sudo mkdir -p /home/rdp/.config/caja
+          sudo chown -R rdp:rdp /home/rdp
+          sudo chmod -R 755 /home/rdp
           
           # Configure MATE desktop session for user 'rdp'
           echo "mate-session" | sudo tee /home/rdp/.xsession >/dev/null
