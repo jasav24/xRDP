@@ -26,16 +26,19 @@ jobs:
           # Fix xrdp group permissions
           sudo adduser xrdp ssl-cert || true
 
-      - name: Create RDP user and set password
+      - name: Create RDP user and set home directory correctly
         run: |
-          # Create user 'rdp' with home directory if not exists
-          sudo useradd -m -s /bin/bash rdp || true
+          # Remove old 'rdp' user if exists to clean up corrupted home dirs
+          sudo userdel -r rdp || true
+          
+          # Create user 'rdp' with proper home directory at /home/rdp
+          sudo useradd -m -d /home/rdp -s /bin/bash rdp
           sudo usermod -aG sudo rdp
           
           # Set password to 1234
           echo "rdp:1234" | sudo chpasswd
           
-          # Fix home directory ownership and permissions completely for 'rdp'
+          # Create config directories and set absolute ownership to 'rdp'
           sudo mkdir -p /home/rdp/.config/caja
           sudo chown -R rdp:rdp /home/rdp
           sudo chmod -R 755 /home/rdp
