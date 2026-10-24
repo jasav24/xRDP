@@ -16,12 +16,13 @@ jobs:
             exit 1
           fi
 
-      - name: Install desktop and xrdp
+      - name: Install MATE desktop and xrdp
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -q
+          # MATE desktop is extremely stable with xrdp and avoids xfconf/dbus session loops
           sudo apt-get install -yq --no-install-recommends \
-            xfce4 xfce4-terminal xorg xorgxrdp xrdp dbus-x11 ssl-cert
+            mate-desktop-environment mate-core mate-terminal xorg xorgxrdp xrdp dbus-x11 ssl-cert
           
           # Fix xrdp group permissions
           sudo adduser xrdp ssl-cert || true
@@ -35,18 +36,8 @@ jobs:
           # Set password to 1234
           echo "rdp:1234" | sudo chpasswd
           
-          # Configure proper XFCE session with D-Bus environment
-          sudo bash -c 'cat << 'EOF' > /home/rdp/.xsession
-          export XDG_CURRENT_DESKTOP=XFCE
-          export XDG_CONFIG_DIRS=/etc/xdg
-          unset DBUS_SESSION_BUS_ADDRESS
-          if which dbus-launch >/dev/null; then
-              exec dbus-launch --exit-with-session startxfce4
-          else
-              exec startxfce4
-          fi
-          EOF'
-
+          # Configure MATE desktop session for user 'rdp'
+          echo "mate-session" | sudo tee /home/rdp/.xsession >/dev/null
           sudo chmod 755 /home/rdp/.xsession
           sudo chown rdp:rdp /home/rdp/.xsession
 
