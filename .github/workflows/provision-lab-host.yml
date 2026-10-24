@@ -6,15 +6,17 @@ on:
 jobs:
   rdp:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360   # hosted runner-এর সর্বোচ্চ সীমা
+    timeout-minutes: 360
 
     env:
       TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
     steps:
       - name: Check secrets
         run: |
           [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
+          [ -n "$RDP_PASSWORD" ] || { echo "::error::RDP_PASSWORD missing"; exit 1; }
 
       - name: Install desktop and xrdp
         run: |
@@ -24,12 +26,10 @@ jobs:
             xfce4 xfce4-terminal xorg xorgxrdp xrdp dbus-x11
           sudo adduser xrdp ssl-cert || true
 
-      - name: Create RDP user with random password
+      - name: Create RDP user
         run: |
-          PW="1234"
-          echo "RDP_PASSWORD=$PW" >> "$GITHUB_ENV"
           sudo useradd -m -s /bin/bash rdpuser
-          printf 'rdpuser:%s\n' "$PW" | sudo chpasswd
+          printf 'rdpuser:%s\n' "$RDP_PASSWORD" | sudo chpasswd
           sudo usermod -aG sudo rdpuser
           printf '#!/bin/sh\nexec startxfce4\n' | sudo tee /home/rdpuser/.xsession >/dev/null
           sudo chmod 755 /home/rdpuser/.xsession
