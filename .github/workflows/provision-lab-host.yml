@@ -1,4 +1,4 @@
-name: RDP-Linux
+name: RDP-Linux-GNOME
 
 on:
   workflow_dispatch:
@@ -11,25 +11,43 @@ jobs:
     env:
       TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       RDP_USER: rdp
-      RDP_PASSWORD: "1234"   # এখানে পছন্দের পাসওয়ার্ড বদলাতে পারবেন
+      RDP_PASSWORD: "1234"   # পছন্দমতো বদলাতে পারবেন
 
     steps:
       - name: Check Tailscale secret
         run: |
           [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
 
-      - name: Install MATE desktop and xrdp
+      - name: Install Ubuntu GNOME desktop and xrdp
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -q
-          sudo apt-get install -yq --no-install-recommends \
-            mate-desktop-environment mate-core mate-terminal \
+          sudo apt-get install -yq \
+            ubuntu-desktop-minimal gnome-terminal \
             xorg xorgxrdp xrdp dbus-x11 ssl-cert
           sudo adduser xrdp ssl-cert || true
 
+          # gdm3 লাগবে না, xrdp নিজেই লগইন দেয়। ওটা চললে display দখল করে
+          sudo systemctl disable --now gdm3 2>/dev/null || true
+          sudo systemctl mask gdm3 2>/dev/null || true
+
+          # xrdp-র Xorg চালাতে অনুমতি
+          sudo mkdir -p /etc/X11
+          printf 'allowed_users=anybody\nneeds_root_rights=yes\n' | sudo tee /etc/X11/Xwrapper.config >/dev/null
+
+          # বারবার "Authentication required" (color manager, packagekit) বন্ধ
+          sudo tee /etc/polkit-1/rules.d/45-allow-rdp.rules >/dev/null <<'EOF'
+          polkit.addRule(function(action, subject) {
+            if (action.id.indexOf("org.freedesktop.color-manager.") == 0 ||
+                action.id.indexOf("org.freedesktop.packagekit.") == 0 ||
+                action.id.indexOf("org.freedesktop.login1.") == 0) {
+              return polkit.Result.YES;
+            }
+          });
+          EOF
+
       - name: Create RDP user
         run: |
-          # পুরোনো ইউজার ও ঝুলে থাকা সেশন পরিষ্কার
           sudo pkill -u "$RDP_USER" || true
           sudo userdel -r "$RDP_USER" 2>/dev/null || true
 
@@ -37,63 +55,52 @@ jobs:
           sudo usermod -aG sudo "$RDP_USER"
           printf '%s:%s\n' "$RDP_USER" "$RDP_PASSWORD" | sudo chpasswd
 
-          # হোম ও কনফিগ ফোল্ডার, সঠিক মালিকানায়
-          sudo mkdir -p "/home/$RDP_USER/.config/caja" "/home/$RDP_USER/.cache" "/home/$RDP_USER/.local/share"
-          sudo chown -R "$RDP_USER:$RDP_USER" "/home/$RDP_USER"
-          sudo chmod 755 "/home/$RDP_USER"
+          sudo mkdir -p "/home/$RDP_USER/.config" "/home/$RDP_USER/.cache" "/home/$RDP_USER/.local/share"
 
-          # runner ইউজারের .config-ও ঠিক রাখি (ভুল ইউজারে ঢুকলেও caja error না আসে)
-          sudo mkdir -p /home/runner/.config/caja
-          sudo chown -R runner:runner /home/runner/.config /home/runner/.cache 2>/dev/null || true
+          # প্রথম লগইনের setup উইজার্ড বন্ধ
+          echo "yes" | sudo tee "/home/$RDP_USER/.config/gnome-initial-setup-done" >/dev/null
 
-          # সেশন স্ক্রিপ্ট: HOME ও পরিবেশ স্পষ্টভাবে সেট
           sudo tee "/home/$RDP_USER/.xsession" >/dev/null <<EOF
           #!/bin/sh
-          export HOME=/home/$RDP_USER
-          export USER=$RDP_USER
-          export LOGNAME=$RDP_USER
-          export XDG_CONFIG_HOME=/home/$RDP_USER/.config
-          export XDG_CACHE_HOME=/home/$RDP_USER/.cache
-          export XDG_DATA_HOME=/home/$RDP_USER/.local/share
-          export XDG_CURRENT_DESKTOP=MATE
-          export DESKTOP_SESSION=mate
-          unset DBUS_SESSION_BUS_ADDRESS
-          unset XDG_RUNTIME_DIR
+          export XDG_SESSION_TYPE=x11
+          export GDK_BACKEND=x11
+          export XDG_CURRENT_DESKTOP=ubuntu:GNOME
+          export GNOME_SHELL_SESSION_MODE=ubuntu
+          export XDG_CONFIG_DIRS=/etc/xdg/xdg-ubuntu:/etc/xdg
+          export XDG_DATA_DIRS=/usr/share/ubuntu:/usr/local/share:/usr/share:/var/lib/snapd/desktop
           cd "\$HOME"
-          exec mate-session
+          exec gnome-session --session=ubuntu
           EOF
           sudo chmod 755 "/home/$RDP_USER/.xsession"
-          sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
+          sudo chown -R "$RDP_USER:$RDP_USER" "/home/$RDP_USER"
 
       - name: Start xrdp
         run: |
-          sudo systemctl enable --now xrdp
+          sudo systemctl enable --now xrdp xrdp-sesman
           sudo systemctl restart xrdp
           sleep 3
           systemctl is-active xrdp
           ss -ltn | grep 3389
 
-      - name: Debug user and permissions
+      - name: Debug
         run: |
-          echo "--- user ---"
           id "$RDP_USER"
-          getent passwd "$RDP_USER"
           sudo passwd -S "$RDP_USER"
-          echo "--- password length: ${#RDP_PASSWORD} ---"
-          echo "--- folders ---"
-          ls -ld "/home/$RDP_USER" "/home/$RDP_USER/.config" "/home/$RDP_USER/.config/caja" /home/runner/.config
+          echo "password length: ${#RDP_PASSWORD}"
           echo "--- .xsession ---"
           cat "/home/$RDP_USER/.xsession"
-          echo "--- xrdp logs ---"
+          echo "--- gnome session files ---"
+          ls /usr/share/xsessions /usr/share/gnome-session/sessions 2>/dev/null
+          echo "--- logind ---"
+          systemctl is-active systemd-logind
           sudo tail -n 20 /var/log/xrdp-sesman.log || true
-          sudo tail -n 20 /var/log/xrdp.log || true
 
       - name: Connect Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo systemctl enable --now tailscaled
           sudo tailscale up --authkey="$TS_AUTHKEY" \
-            --hostname="gh-linux-${GITHUB_RUN_ID}"
+            --hostname="gh-gnome-${GITHUB_RUN_ID}"
           TS_IP=""
           for i in $(seq 1 12); do
             TS_IP="$(tailscale ip -4 | head -n1 || true)"
@@ -111,7 +118,7 @@ jobs:
           echo " Password: $RDP_PASSWORD"
           echo "========================================="
           while true; do
-            echo "[$(date)] RDP active. Running desktop sessions:"
-            ps -eo user,pid,cmd | grep -E "mate-session|Xorg|xrdp-sesman" | grep -v grep || echo "  (no session yet)"
+            echo "[$(date)] RDP active. Sessions:"
+            ps -eo user,pid,cmd | grep -E "gnome-shell|gnome-session|Xorg" | grep -v grep || echo "  (no session yet)"
             sleep 300
           done
