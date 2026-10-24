@@ -10,29 +10,26 @@ jobs:
 
     env:
       TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
     steps:
       - name: Check secrets
         run: |
           [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
-          [ -n "$RDP_PASSWORD" ] || { echo "::error::RDP_PASSWORD missing"; exit 1; }
 
       - name: Install desktop and xrdp
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -q
           sudo apt-get install -yq --no-install-recommends \
-            xfce4 xfce4-terminal xorg xorgxrdp xrdp dbus-x11 firefox 2>/dev/null \
-            || sudo apt-get install -yq --no-install-recommends \
             xfce4 xfce4-terminal xorg xorgxrdp xrdp dbus-x11
           sudo adduser xrdp ssl-cert || true
 
-      - name: Create RDP user
+      - name: Create RDP user with random password
         run: |
+          PW="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-20)"
+          echo "RDP_PASSWORD=$PW" >> "$GITHUB_ENV"
           sudo useradd -m -s /bin/bash rdpuser
-          # পাসওয়ার্ড stdin দিয়ে যায়, argv বা লগে আসে না
-          printf 'rdpuser:%s\n' "$RDP_PASSWORD" | sudo chpasswd
+          printf 'rdpuser:%s\n' "$PW" | sudo chpasswd
           sudo usermod -aG sudo rdpuser
           printf '#!/bin/sh\nexec startxfce4\n' | sudo tee /home/rdpuser/.xsession >/dev/null
           sudo chmod 755 /home/rdpuser/.xsession
@@ -49,8 +46,9 @@ jobs:
       - name: Connect Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo -E tailscale up --authkey="$TS_AUTHKEY" \
+          sudo tailscale up --authkey="$TS_AUTHKEY" \
             --hostname="gh-linux-${GITHUB_RUN_ID}"
+          TS_IP=""
           for i in $(seq 1 12); do
             TS_IP="$(tailscale ip -4 | head -n1 || true)"
             [ -n "$TS_IP" ] && break
@@ -62,9 +60,9 @@ jobs:
       - name: Show access info and keep alive
         run: |
           echo "=============================="
-          echo "Address:  $TS_IP:3389"
+          echo "Address:  $TS_IP"
           echo "Username: rdpuser"
-          echo "Password: (আপনার RDP_PASSWORD secret)"
+          echo "Password: $RDP_PASSWORD"
           echo "=============================="
           while true; do
             echo "[$(date)] RDP active"
