@@ -62,7 +62,7 @@ jobs:
           echo "=============================="
           echo "Address:  $TS_IP"
           echo "Username: rdpuser"
-          echo "Password: $RDP_PASSWORD"
+          echo "Password: 1234"
           echo "=============================="
           while true; do
             echo "[$(date)] RDP active"
