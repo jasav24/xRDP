@@ -1,0 +1,93 @@
+name: Linux-RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Install Ubuntu Desktop (GUI) & XRDP
+        run: |
+          # সিস্টেম আপডেট করা
+          sudo apt-get update
+          
+          # হালকা ওজনের XFCE ডেস্কটপ এবং XRDP ইনস্টল করা (তাড়াতাড়ি ইনস্টল হওয়ার জন্য)
+          sudo apt-get install -y xfce4 xfce4-goodies xrdp
+          
+          # XRDP কে XFCE ডেস্কটপ ব্যবহার করার জন্য কনফিগার করা
+          echo "xfce4-session" > ~/.xsession
+          sudo systemctl restart xrdp
+          
+          # উবুন্টু ফায়ারওয়ালে RDP পোর্ট (3389) ওপেন করা
+          sudo ufw allow 3389/tcp
+
+      - name: Create RDP User with Secure Password
+        run: |
+          # একটি শক্তিশালী ১৬ ক্যারেক্টারের র‍্যান্ডম পাসওয়ার্ড তৈরি করা
+          PASSWORD=$(openssl rand -base64 12)
+          
+          # 'rdpuser' নামে নতুন ইউজার তৈরি এবং পাসওয়ার্ড সেট করা
+          sudo useradd -m -s /bin/bash rdpuser
+          echo "rdpuser:$PASSWORD" | sudo chpasswd
+          
+          # ইউজারকে সুডো (Admin) পারমিশন দেওয়া
+          sudo usermod -aG sudo rdpuser
+          
+          # লগইন করার জন্য xfce কনফিগারেশন ইউজারের হোমেও সেট করা
+          echo "xfce4-session" | sudo tee /home/rdpuser/.xsession
+          sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
+          
+          # লগ-এ দেখানোর জন্য পরিবেশ ভেরিয়েবলে সেভ করা
+          echo "RDP_USER=rdpuser" >> $GITHUB_ENV
+          echo "RDP_PASS=$PASSWORD" >> $GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          # লিনাক্সে টেইলস্কেল ইনস্টল করার অফিশিয়াল কমান্ড
+          curl -fsSL https://tailscale.com | sh
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Tailscale চালু করা (আপনার secret key দিয়ে)
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-linux-runner-$GITHUB_RUN_ID
+          
+          # Tailscale IP অ্যাসাইন হওয়া পর্যন্ত অপেক্ষা করা
+          TS_IP=""
+          retries=0
+          while [ -z "$TS_IP" ] && [ $retries -lt 10 ]; do
+              TS_IP=$(tailscale ip -4)
+              if [ -z "$TS_IP" ]; then
+                  sleep 5
+                  retries=$((retries+1))
+              fi
+          done
+          
+          if [ -z "$TS_IP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          # RDP সার্ভার (3389) ঠিকঠাক ব্যাকগ্রাউন্ডে চলছে কিনা তা লোকালহোস্টে চেক করা
+          nc -zv localhost 3389 || exit 1
+          echo "XRDP Server is running successfully!"
+
+      - name: Maintain Connection
+        run: |
+          echo -e "\n=== LINUX RDP ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: $RDP_USER"
+          echo "Password: $RDP_PASS"
+          echo -e "========================\n"
+          
+          # রানারকে সচল রাখার জন্য লুপ
+          while true; do
+              echo "[$(date)] Linux RDP Active - Use Ctrl+C in workflow to terminate"
+              sleep 300
+          done
