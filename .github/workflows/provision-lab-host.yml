@@ -1,0 +1,230 @@
+name: Provision lab host (xrdp over Tailscale)
+
+# GitHub is the delivery mechanism, not the server. This job SSHes to a host you
+# provisioned at your own provider, copies xrdp-tailscale-setup.sh, runs it
+# there, and cleans up. Nothing here opens a listener on the runner, holds a
+# runner alive beyond its job, or writes a credential into a log.
+#
+# Put this file and xrdp-tailscale-setup.sh in the same repository.
+#
+# Secrets required:
+#   LAB_HOST_SSH          user@host of the machine you own
+#   LAB_SSH_PRIVATE_KEY   deploy key whose public half is in the host's
+#                         authorized_keys (key auth only; BatchMode rejects
+#                         any password prompt)
+#   LAB_HOST_KNOWN_HOSTS  pinned host key, no trust-on-first-use
+#   TAILSCALE_AUTH_KEY    pre-authenticated, pre-expiry-limited key
+# Optional secret:
+#   LAB_DESKTOP_PASSWORD  if set, becomes the desktop account's RDP password.
+#                         Unset = the account stays locked until you run
+#                         `sudo passwd <user>` on the host yourself.
+# Variable required:
+#   none. DESKTOP_USER / TS_HOSTNAME come from the dispatch inputs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      desktop_user:
+        description: "Desktop account to create on the host"
+        required: false
+        default: builder
+      tailscale_hostname:
+        description: "Name this host gets inside your tailnet"
+        required: false
+        default: lab-chromium
+      apply:
+        description: "dry-run connects, checks, installs nothing; apply provisions"
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - apply
+        default: dry-run
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provision-lab-host
+  # Overlapping runs would fight over ufw rules and restart xrdp under someone
+  # already logged in, so never cancel an in-flight provision.
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Manual approval before anything can mutate a host.
+    environment: lab-host
+
+    env:
+      LAB_HOST_SSH: ${{ secrets.LAB_HOST_SSH }}
+      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      KNOWN_HOSTS: ${{ secrets.LAB_HOST_KNOWN_HOSTS }}
+      SSH_PRIVATE_KEY: ${{ secrets.LAB_SSH_PRIVATE_KEY }}
+      DESKTOP_USER: ${{ inputs.desktop_user }}
+      TS_HOSTNAME: ${{ inputs.tailscale_hostname }}
+      # Optional. If it is unset the script leaves the account locked and you
+      # set the password yourself on the host. It is never echoed, and the
+      # staged copy is shredded in an always() step.
+      DESKTOP_PASSWORD: ${{ secrets.LAB_DESKTOP_PASSWORD }}
+
+    steps:
+      - name: Check the inputs before touching a network
+        run: |
+          set -euo pipefail
+          missing=0
+          for pair in "LAB_HOST_SSH=$LAB_HOST_SSH" "LAB_SSH_PRIVATE_KEY=$SSH_PRIVATE_KEY" \
+                      "KNOWN_HOSTS=$KNOWN_HOSTS" "TS_AUTHKEY=$TS_AUTHKEY"; do
+            name="${pair%%=*}"
+            if [ -z "${pair#*=}" ]; then
+              echo "::error::$name is not configured"
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ] || exit 1
+          # Never the runner itself: it is ephemeral, has no inbound path, and
+          # is not yours to turn into a remote-access host.
+          case "$LAB_HOST_SSH" in
+            *@localhost|*@127.0.0.1|*@::1)
+              echo "::error::LAB_HOST_SSH points at the runner. Point it at a host you provisioned."
+              exit 1;;
+          esac
+          case "$DESKTOP_USER" in
+            root|*[!a-z0-9_-]*)
+              echo "::error::DESKTOP_USER '$DESKTOP_USER' is not a valid unprivileged username"
+              exit 1;;
+          esac
+          echo "inputs ok (target user@host is configured, name is not printed)"
+
+      - name: Check out the operator script
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare SSH
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ssh/id_deploy"
+          printf '%s\n' "$KNOWN_HOSTS"      > "$RUNNER_TEMP/ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/ssh/id_deploy" "$RUNNER_TEMP/ssh/known_hosts"
+          export SSH_OPTS="-i $RUNNER_TEMP/ssh/id_deploy -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts"
+          ssh-keygen -lf "$RUNNER_TEMP/ssh/known_hosts"
+
+      - name: Read the host's current state
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/ssh/id_deploy"
+          KH="$RUNNER_TEMP/ssh/known_hosts"
+          ssh -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" \
+              "$LAB_HOST_SSH" bash -s -- <<'END_READ'
+          set -euo pipefail
+          echo "distro:  $( . /etc/os-release; echo "$PRETTY_NAME" )"
+          echo "kernel:  $(uname -r)"
+          echo "cpu:     $(nproc)"
+          echo "ram_gib: $(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo)"
+          echo "disk_/:"; df -h / | tail -1
+          echo "xrdp:    $(systemctl is-active xrdp 2>/dev/null || echo inactive)"
+          echo "tailscale: $(command -v tailscale || echo not-installed)"
+          echo "listening 3389/22:"; ss -ltn 2>/dev/null | awk 'NR==1 || /:3389|:22/' || true
+          END_READ
+
+      - name: Copy the script to the host
+        if: inputs.apply == 'apply'
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/ssh/id_deploy"; KH="$RUNNER_TEMP/ssh/known_hosts"
+          scp -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" \
+              ./xrdp-tailscale-setup.sh "$LAB_HOST_SSH":xrdp-tailscale-setup.sh
+
+      - name: Stage the Tailscale key on the host
+        if: inputs.apply == 'apply'
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/ssh/id_deploy"; KH="$RUNNER_TEMP/ssh/known_hosts"
+          # The key travels over the already-authenticated SSH channel on stdin
+          # and lands in a 0600 file. It is deliberately NOT put in a command
+          # line, where every `ps` on the host (and any process auditor) would
+          # see it.
+          printf '%s' "$TS_AUTHKEY" | ssh -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" "$LAB_HOST_SSH" \
+            'umask 077; f=$(mktemp "$HOME/.tskey.XXXXXX"); cat > "$f"; echo "$f" > "$HOME/.tskey.path"; echo "staged tskey bytes=$(wc -c < "$f")"'
+
+      - name: Stage the desktop password on the host
+        if: inputs.apply == 'apply'
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/ssh/id_deploy"; KH="$RUNNER_TEMP/ssh/known_hosts"
+          # Optional. With no LAB_DESKTOP_PASSWORD secret the script leaves the
+          # account locked and you set the password yourself with `sudo passwd`.
+          if [ -z "${DESKTOP_PASSWORD:-}" ]; then
+            echo "LAB_DESKTOP_PASSWORD is not configured - the account stays password-less until you set one on the host."
+            exit 0
+          fi
+          printf '%s' "$DESKTOP_PASSWORD" | ssh -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" "$LAB_HOST_SSH" \
+            'umask 077; f=$(mktemp "$HOME/.tspw.XXXXXX"); cat > "$f"; echo "$f" > "$HOME/.tspw.path"; echo "password staged at 0600 (byte count deliberately not printed)"'
+
+      - name: Run the provisioning script on the host
+        if: inputs.apply == 'apply'
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/ssh/id_deploy"; KH="$RUNNER_TEMP/ssh/known_hosts"
+          ssh -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" \
+              "$LAB_HOST_SSH" bash -s -- "$DESKTOP_USER" "$TS_HOSTNAME" <<'END_RUN'
+          set -euo pipefail
+          DESKTOP_USER="$1"; TS_HOSTNAME="$2"
+          TS_KEY_FILE="$(cat "$HOME/.tskey.path")"
+          # Empty when the optional secret is unset; the script then leaves the
+          # password alone.
+          PW_FILE="$(cat "$HOME/.tspw.path" 2>/dev/null || true)"
+          # sudo resets the environment, so hand it the variables explicitly
+          # rather than relying on env_keep. Only ever the *paths* travel in
+          # argv - the key and the password stay inside their 0600 files.
+          sudo -E env TS_AUTHKEY_FILE="$TS_KEY_FILE" DESKTOP_USER="$DESKTOP_USER" \
+                    TS_HOSTNAME="$TS_HOSTNAME" DESKTOP_PASSWORD_FILE="$PW_FILE" \
+            bash ./xrdp-tailscale-setup.sh
+          END_RUN
+
+      - name: Shred the staged key
+        if: inputs.apply == 'apply' && always()
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/ssh/id_deploy"; KH="$RUNNER_TEMP/ssh/known_hosts"
+          ssh -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" "$LAB_HOST_SSH" \
+            'set -e; for p in .tskey .tspw; do if [ -f "$HOME/$p.path" ]; then f="$(cat "$HOME/$p.path")"; shred -u -z -n 1 "$f" 2>/dev/null || rm -f "$f"; rm -f "$HOME/$p.path"; echo "removed $p"; else echo "nothing to remove for $p"; fi; done'
+
+      - name: Report only what is safe to read
+        if: inputs.apply == 'apply'
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/ssh/id_deploy"; KH="$RUNNER_TEMP/ssh/known_hosts"
+          ssh -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" \
+              "$LAB_HOST_SSH" bash -s -- "$DESKTOP_USER" <<'END_VERIFY'
+          set -euo pipefail
+          DESKTOP_USER="$1"
+          echo "tailnet address: $(tailscale ip -4 2>/dev/null | head -n1)"
+          echo "xrdp service:    $(systemctl is-active xrdp)"
+          echo "listener check (3389 must be bound, and only reachable via the tail):"
+          ss -ltn | awk 'NR==1 || /:3389|:22/'
+          echo "firewall rules:"
+          sudo ufw status numbered | sed -n '1,40p'
+          echo
+          echo "Connect from a device on the same tailnet:  mstsc /v:$(tailscale ip -4 | head -n1)"
+          # `passwd -S` reports only the state (P / LK / NP), never the value.
+          echo "password state for $DESKTOP_USER: $(sudo passwd -S "$DESKTOP_USER" | awk '{print $2}')"
+          END_VERIFY
+
+      - name: What a dry-run did not do
+        if: inputs.apply == 'dry-run'
+        run: |
+          echo "dry-run: read the host state only. No packages installed, no firewall"
+          echo "changed, no Tailscale node registered. Re-run with apply=true to provision."

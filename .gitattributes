@@ -1,0 +1,3 @@
+# Operator tooling: these must stay LF or bash on the host chokes.
+*.sh  text eol=lf
+*.yml text eol=lf
