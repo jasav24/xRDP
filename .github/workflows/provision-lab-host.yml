@@ -5,7 +5,7 @@ on:
 
 jobs:
   rdp:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest-24.04
     timeout-minutes: 360
 
     env:
