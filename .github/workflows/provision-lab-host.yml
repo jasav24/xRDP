@@ -52,7 +52,12 @@ concurrency:
 
 jobs:
   provision:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: since 2026-10-19 that label is rolling over to
+    # Ubuntu 26.04 (actions/runner-images#14748, completing 2026-11-19). This job
+    # only needs ssh/scp/curl, but a silent OS change here would still surface as
+    # "the provisioning script broke" - and the target host, not this runner, is
+    # where the Ubuntu 24.04 requirement actually applies.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     # Manual approval before anything can mutate a host.
     environment: lab-host

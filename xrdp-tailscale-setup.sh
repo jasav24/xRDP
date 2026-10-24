@@ -38,7 +38,14 @@ fi
 [ "$(id -u)" = 0 ] || die "run as root (sudo -E preserves the env vars you set)"
 
 . /etc/os-release
-[ "${ID:-}" = ubuntu ] || die "tested on Ubuntu 24.04 only; this is ${ID:-unknown}"
+# Only ID is checked: the packages this installs (xfce4/xrdp/ufw) exist in every
+# recent Ubuntu, so 22.04 or 26.04 will usually work - but it is untested there,
+# so print the exact release in the error rather than claiming 24.04 is required.
+[ "${ID:-}" = ubuntu ] || die "this is ${PRETTY_NAME:-unknown}, not Ubuntu; tested on 24.04"
+case "${VERSION_ID:-}" in
+  24.04) ;;
+  *) echo "NOTE: this is ${PRETTY_NAME:-ubuntu} and only 24.04 has been tested here." ;;
+esac
 
 : "${TS_AUTHKEY_FILE:?set TS_AUTHKEY_FILE to the path of your auth-key file}"
 DESKTOP_USER="${DESKTOP_USER:-builder}"
