@@ -1,391 +1,72 @@
-name: Provision lab host (xrdp over Tailscale)
-
-# Self-contained: one dispatch, no companion file. The provisioning logic lives
-# inside this YAML and is streamed to the host over SSH, so there is no script to
-# keep in sync, nothing to copy manually and nothing to run by hand.
-#
-# It still needs a host, which is the one thing a workflow cannot invent: GitHub's
-# Actions usage policy bars a hosted runner from being an interactive remote-access
-# seat, and a runner's desktop dies at job teardown anyway. So this YAML SSHes to an
-# Ubuntu 24.04 machine you rent, turns it into the RDP host, and exits.
-#
-# Secrets required:
-#   LAB_HOST_SSH          user@host of the machine you own
-#   LAB_SSH_PRIVATE_KEY   deploy key whose public half is in the host's
-#                         authorized_keys (key auth only; BatchMode rejects
-#                         any password prompt)
-#   LAB_HOST_KNOWN_HOSTS  pinned host key, no trust-on-first-use
-#   TAILSCALE_AUTH_KEY    pre-authenticated, pre-expiry-limited key
-# Optional secret:
-#   LAB_DESKTOP_PASSWORD  becomes the desktop account's RDP password. Unset = the
-#                         account stays locked until you run `sudo passwd <user>`.
-#                         Never echoed; the staged copy is shredded on always().
-# Host prerequisite:
-#   The SSH user needs passwordless sudo (NOPASSWD), because the provisioning block
-#   runs under `sudo -n` over a non-tty stdin. Without it the job fails fast with a
-#   clear message instead of hanging on a prompt you cannot answer.
+name: RDP-Linux
 
 on:
   workflow_dispatch:
-    inputs:
-      desktop_user:
-        description: "Desktop account to create on the host"
-        required: false
-        default: builder
-      tailscale_hostname:
-        description: "Name this host gets inside your tailnet"
-        required: false
-        default: lab-chromium
-      ssh_from:
-        description: "tail = port 22 only on tailscale0; any = also on the public NIC"
-        required: false
-        type: choice
-        options:
-          - tail
-          - any
-        default: tail
-      apply:
-        description: "dry-run connects, checks, installs nothing; apply provisions"
-        required: true
-        type: choice
-        options:
-          - dry-run
-          - apply
-        default: dry-run
-
-permissions:
-  contents: read
-
-concurrency:
-  group: provision-lab-host
-  # Overlapping runs would fight over ufw rules and restart xrdp under someone
-  # already logged in, so never cancel an in-flight provision.
-  cancel-in-progress: false
 
 jobs:
-  provision:
-    # Pinned, not ubuntu-latest: since 2026-10-19 that label is rolling over to
-    # Ubuntu 26.04 (actions/runner-images#14748, completing 2026-11-19). This job
-    # only needs ssh/scp/curl, but a silent OS change here would still surface as
-    # "provisioning broke" - and the target host, not this runner, is where the
-    # Ubuntu 24.04 requirement actually applies.
+  rdp:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # Manual approval before anything can mutate a host.
-    environment: lab-host
+    timeout-minutes: 360   # hosted runner-এর সর্বোচ্চ সীমা
 
     env:
-      LAB_HOST_SSH: ${{ secrets.LAB_HOST_SSH }}
       TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      KNOWN_HOSTS: ${{ secrets.LAB_HOST_KNOWN_HOSTS }}
-      SSH_PRIVATE_KEY: ${{ secrets.LAB_SSH_PRIVATE_KEY }}
-      DESKTOP_USER: ${{ inputs.desktop_user }}
-      TS_HOSTNAME: ${{ inputs.tailscale_hostname }}
-      ALLOW_SSH_FROM: ${{ inputs.ssh_from }}
-      # Optional. If it is unset the account stays locked and you set the
-      # password yourself on the host.
-      DESKTOP_PASSWORD: ${{ secrets.LAB_DESKTOP_PASSWORD }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
     steps:
-      - name: Check the inputs before touching a network
+      - name: Check secrets
         run: |
-          set -euo pipefail
-          missing=()
-          [ -n "$LAB_HOST_SSH" ]      || missing+=("LAB_HOST_SSH            (user@host of the machine you own)")
-          [ -n "$SSH_PRIVATE_KEY" ]   || missing+=("LAB_SSH_PRIVATE_KEY       (deploy key, public half in authorized_keys)")
-          [ -n "$KNOWN_HOSTS" ]       || missing+=("LAB_HOST_KNOWN_HOSTS      (pinned host key line)")
-          [ -n "$TS_AUTHKEY" ]        || missing+=("TAILSCALE_AUTH_KEY        (Tailscale pre-authenticated key)")
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error::this repository is not configured yet. Add these as secrets on ${GITHUB_REPOSITORY}:"
-            printf '  %s\n' "${missing[@]}"
-            echo "Settings -> Secrets and variables -> Actions -> New repository secret. Then re-dispatch."
-            echo "(optional) LAB_DESKTOP_PASSWORD sets the RDP password; without it the account stays locked"
-            echo "until you run 'sudo passwd <user>' on the host."
-            exit 1
-          fi
-          # Never the runner itself: it is ephemeral, has no inbound path, and
-          # GitHub's usage policy excludes it as a remote-access host. This gate
-          # is the reason no companion script guard is needed any more.
-          case "$LAB_HOST_SSH" in
-            *@localhost|*@127.0.0.1|*@::1)
-              echo "::error::LAB_HOST_SSH points at the runner. Point it at a host you provisioned."
-              exit 1;;
-          esac
-          case "$DESKTOP_USER" in
-            root|*[!a-z0-9_-]*)
-              echo "::error::DESKTOP_USER '$DESKTOP_USER' is not a valid unprivileged username"
-              exit 1;;
-          esac
-          echo "inputs ok (target user@host is configured, name is not printed)"
+          [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
+          [ -n "$RDP_PASSWORD" ] || { echo "::error::RDP_PASSWORD missing"; exit 1; }
 
-      - name: Prepare SSH
-        id: ssh_prep
+      - name: Install desktop and xrdp
         run: |
-          set -euo pipefail
-          umask 077
-          mkdir -p "$RUNNER_TEMP/ssh"
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ssh/id_deploy"
-          printf '%s\n' "$KNOWN_HOSTS"      > "$RUNNER_TEMP/ssh/known_hosts"
-          chmod 600 "$RUNNER_TEMP/ssh/id_deploy" "$RUNNER_TEMP/ssh/known_hosts"
-          ssh-keygen -lf "$RUNNER_TEMP/ssh/known_hosts"
-
-      - name: Read the host's current state
-        run: |
-          set -euo pipefail
-          ssh -i "$RUNNER_TEMP/ssh/id_deploy" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
-              "$LAB_HOST_SSH" bash -s -- <<'END_READ'
-          set -euo pipefail
-          echo "distro:     $( . /etc/os-release; echo "$PRETTY_NAME" )"
-          echo "kernel:     $(uname -r)"
-          echo "cpu:        $(nproc)"
-          echo "ram_gib:    $(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo)"
-          echo "disk_/:"; df -h / | tail -1
-          echo "sudo -n:    $(sudo -n true 2>/dev/null && echo 'passwordless, good' || echo 'WILL FAIL - needs NOPASSWD')"
-          echo "xrdp:       $(systemctl is-active xrdp 2>/dev/null || echo inactive)"
-          echo "tailscale:  $(command -v tailscale || echo not-installed)"
-          echo "listening 3389/22:"; ss -ltn 2>/dev/null | awk 'NR==1 || /:3389|:22/' || true
-          END_READ
-
-      - name: Stage the Tailscale key on the host
-        if: inputs.apply == 'apply' && success()
-        run: |
-          set -euo pipefail
-          # The key travels over the already-authenticated SSH channel on stdin
-          # and lands in a 0600 file. It is deliberately NOT put in a command
-          # line, where every `ps` on the host (and any process auditor) would
-          # see it.
-          printf '%s' "$TS_AUTHKEY" | ssh -i "$RUNNER_TEMP/ssh/id_deploy" \
-            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" "$LAB_HOST_SSH" \
-            'umask 077; f=$(mktemp "$HOME/.tskey.XXXXXX"); cat > "$f"; echo "$f" > "$HOME/.tskey.path"; echo "staged tskey bytes=$(wc -c < "$f")"'
-
-      - name: Stage the desktop password on the host
-        if: inputs.apply == 'apply' && success()
-        run: |
-          set -euo pipefail
-          # Optional. With no LAB_DESKTOP_PASSWORD secret the account is left
-          # locked and you set the password yourself with `sudo passwd`.
-          if [ -z "${DESKTOP_PASSWORD:-}" ]; then
-            echo "LAB_DESKTOP_PASSWORD is not configured - the account stays password-less until you set one on the host."
-            exit 0
-          fi
-          printf '%s' "$DESKTOP_PASSWORD" | ssh -i "$RUNNER_TEMP/ssh/id_deploy" \
-            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" "$LAB_HOST_SSH" \
-            'umask 077; f=$(mktemp "$HOME/.tspw.XXXXXX"); cat > "$f"; echo "$f" > "$HOME/.tspw.path"; echo "password staged at 0600 (byte count deliberately not printed)"'
-
-      - name: Provision xrdp + Tailscale on the host
-        if: inputs.apply == 'apply' && success()
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          # Everything below the first line is the provisioning logic itself,
-          # streamed to the host and run there under sudo. Only ever the *paths*
-          # travel in argv - the auth key and the password stay inside their
-          # 0600 files.
-          ssh -i "$RUNNER_TEMP/ssh/id_deploy" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
-              "$LAB_HOST_SSH" bash -s -- "$DESKTOP_USER" "$TS_HOSTNAME" "$ALLOW_SSH_FROM" <<'END_PROVISION'
-          set -euo pipefail
-          DESKTOP_USER="$1"; TS_HOSTNAME="$2"; ALLOW_SSH_FROM="$3"
-          TS_KEY_FILE="$(cat "$HOME/.tskey.path")"
-          PW_FILE="$(cat "$HOME/.tspw.path" 2>/dev/null || true)"
-          sudo -n -E env TS_AUTHKEY_FILE="$TS_KEY_FILE" DESKTOP_PASSWORD_FILE="$PW_FILE" \
-                       DESKTOP_USER="$DESKTOP_USER" TS_HOSTNAME="$TS_HOSTNAME" \
-                       ALLOW_SSH_FROM="$ALLOW_SSH_FROM" \
-            bash -s <<'ROOT_SCRIPT'
-          set -Eeuo pipefail
-          trap 'echo "FAILED at line $LINENO" >&2' ERR
-          log() { printf '==> %s\n' "$*"; }
-          die() { echo "ERROR: $*" >&2; exit 1; }
-
-          [ "$(id -u)" = 0 ] || die "the sudo -n above did not give us root"
-          . /etc/os-release
-          [ "${ID:-}" = ubuntu ] || die "this is ${PRETTY_NAME:-unknown}, not Ubuntu; tested on 24.04"
-          case "${VERSION_ID:-}" in
-            24.04) ;;
-            *) echo "NOTE: this is ${PRETTY_NAME:-ubuntu} and only 24.04 has been tested here." ;;
-          esac
-
-          : "${TS_AUTHKEY_FILE:?auth-key file path must be set}"
-          DESKTOP_USER="${DESKTOP_USER:-builder}"
-          TS_HOSTNAME="${TS_HOSTNAME:-lab-$(hostname -s | tr -cd 'a-zA-Z0-9' | cut -c1-8)}"
-          ALLOW_SSH_FROM="${ALLOW_SSH_FROM:-tail}"
-          [ -f "$TS_AUTHKEY_FILE" ] || die "$TS_AUTHKEY_FILE does not exist"
-          [ "$(stat -c '%a' "$TS_AUTHKEY_FILE")" = 600 ] || die "$TS_AUTHKEY_FILE must be mode 600"
-          [ -s "$TS_AUTHKEY_FILE" ] || die "$TS_AUTHKEY_FILE is empty"
-
-          log "installing desktop + xrdp"
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update -q
-          apt-get install -yq --no-install-recommends \
-            xfce4 xfce4-terminal xfce4-goodies xorg xorgxrdp xrdp dbus-x11 \
-            ufw curl ca-certificates
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends \
+            xfce4 xfce4-terminal xorg xorgxrdp xrdp dbus-x11 firefox 2>/dev/null \
+            || sudo apt-get install -yq --no-install-recommends \
+            xfce4 xfce4-terminal xorg xorgxrdp xrdp dbus-x11
+          sudo adduser xrdp ssl-cert || true
 
-          log "creating the desktop account"
-          if ! id "$DESKTOP_USER" >/dev/null 2>&1; then
-            useradd -m -s /bin/bash "$DESKTOP_USER"
-            if [ -z "${DESKTOP_PASSWORD_FILE:-}" ]; then
-              echo "No password was generated or printed anywhere. Set one on the host:"
-              echo "    sudo passwd $DESKTOP_USER"
-            fi
-          else
-            log "user $DESKTOP_USER already exists"
-          fi
+      - name: Create RDP user
+        run: |
+          sudo useradd -m -s /bin/bash rdpuser
+          # পাসওয়ার্ড stdin দিয়ে যায়, argv বা লগে আসে না
+          printf 'rdpuser:%s\n' "$RDP_PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo rdpuser
+          printf '#!/bin/sh\nexec startxfce4\n' | sudo tee /home/rdpuser/.xsession >/dev/null
+          sudo chmod 755 /home/rdpuser/.xsession
+          sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
 
-          # The explicit request wins over the "leave it alone" default, so this
-          # provision can be re-run to fix a lost password.
-          if [ -n "${DESKTOP_PASSWORD_FILE:-}" ]; then
-            [ -f "$DESKTOP_PASSWORD_FILE" ] || die "$DESKTOP_PASSWORD_FILE does not exist"
-            [ "$(stat -c '%a' "$DESKTOP_PASSWORD_FILE")" = 600 ] || die "$DESKTOP_PASSWORD_FILE must be mode 600"
-            [ -s "$DESKTOP_PASSWORD_FILE" ] || die "$DESKTOP_PASSWORD_FILE is empty"
-            # chpasswd splits on the FIRST colon, so a password containing ':' is safe.
-            { printf '%s:' "$DESKTOP_USER"; tr -d '\n' < "$DESKTOP_PASSWORD_FILE"; printf '\n'; } | chpasswd
-            passwd -S "$DESKTOP_USER" | awk '{print "  login state:", $2}'
-            PW_LEN=$(tr -d '\n' < "$DESKTOP_PASSWORD_FILE" | wc -c)
-            if [ "$PW_LEN" -lt 12 ]; then
-              echo "  WARNING: the password is under 12 characters. That is survivable"
-              echo "  only because 3389 is bound to tailscale0 and denied elsewhere. If"
-              echo "  you ever widen that, replace this password first - an RDP listener"
-              echo "  with a short password on a public address gets brute-forced."
-            fi
-          fi
+      - name: Start xrdp
+        run: |
+          sudo systemctl enable --now xrdp
+          sudo systemctl restart xrdp
+          sleep 3
+          systemctl is-active xrdp
+          ss -ltn | grep 3389
 
-          # xrdp's /etc/xrdp/startwm.sh only honours ~/.xsession when it is
-          # *executable*; a 644 file is skipped silently and you get a black
-          # screen after login.
-          if [ ! -f "/home/$DESKTOP_USER/.xsession" ]; then
-            printf '#!/bin/sh\nexec startxfce4\n' > "/home/$DESKTOP_USER/.xsession"
-          fi
-          chmod 755 "/home/$DESKTOP_USER/.xsession"
-          chown "$DESKTOP_USER:$DESKTOP_USER" "/home/$DESKTOP_USER/.xsession"
-
-          log "hardening /etc/xrdp/xrdp.ini"
-          if ! grep -q 'xrdp-setup-applied' /etc/xrdp/xrdp.ini; then
-            cp -a /etc/xrdp/xrdp.ini "/etc/xrdp/xrdp.ini.bak.$(date +%s)"
-            sed -i -E 's/^security_layer=.*/security_layer=negotiate/; s/^crypt_level=.*/crypt_level=high/' /etc/xrdp/xrdp.ini
-            sed -i -E 's/^#?allow_channels=.*/allow_channels=<rdpsnd,cliprdr>/; s/^#?NeverResetPassword=.*/NeverResetPassword=true/' /etc/xrdp/xrdp.ini
-            printf '\n# tls + high crypt enforced by provision-lab-host.yml (xrdp-setup-applied)\n' >> /etc/xrdp/xrdp.ini
-          fi
-          # Report, don't assume: these seds match a file whose exact keys vary by
-          # xrdp release, and a sed that matches nothing fails silently - which
-          # would leave you believing NLA + high crypt were on.
-          log "effective xrdp.ini settings"
-          grep -E '^(security_layer|crypt_level|allow_channels|NeverResetPassword)=' /etc/xrdp/xrdp.ini \
-            | sed 's/^/  /' || echo "  (none of those keys are present - xrdp is using its defaults)"
-          chmod 640 /etc/xrdp/cert.pem /etc/xrdp/key.pem 2>/dev/null || true
-          chgrp xrdp /etc/xrdp/key.pem 2>/dev/null || true
-
-          systemctl enable --now xrdp
-          systemctl restart xrdp
-
-          log "installing tailscale"
-          if ! command -v tailscale >/dev/null 2>&1; then
-            curl -fsSL https://tailscale.com/install.sh | sh
-          fi
-
-          # TS_AUTHKEY is read from the file into the environment, so the key
-          # never appears in argv.
-          umask 077
-          TS_AUTHKEY="$(< "$TS_AUTHKEY_FILE")"
-          export TS_AUTHKEY
-          tailscale up --hostname="$TS_HOSTNAME" --ssh > /tmp/ts-up.log 2>&1 || {
-            cat /tmp/ts-up.log; unset TS_AUTHKEY; die "tailscale up failed (see the message above)"
-          }
-          unset TS_AUTHKEY
-
+      - name: Connect Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo -E tailscale up --authkey="$TS_AUTHKEY" \
+            --hostname="gh-linux-${GITHUB_RUN_ID}"
           for i in $(seq 1 12); do
-            TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+            TS_IP="$(tailscale ip -4 | head -n1 || true)"
             [ -n "$TS_IP" ] && break
             sleep 5
           done
-          [ -n "${TS_IP:-}" ] || die "no tailscale IPv4 after 60s; check 'tailscale status' and the key's expiry"
+          [ -n "$TS_IP" ] || { echo "::error::no Tailscale IP"; exit 1; }
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
 
-          log "firewall: 3389 and 22 reachable on tailscale0 only"
-          # Existing rules are kept on purpose: `ufw --force reset` would delete
-          # whatever you configured before, and on a box you already use that is a
-          # self-inflicted outage.
-          ufw default deny incoming
-          ufw default allow outgoing
-          # Explicit deny first keeps the rule honest even if the allow is edited later.
-          ufw deny in proto tcp to any port 3389 comment 'rdp off the public net'
-          ufw allow in on tailscale0 to any port 3389 proto tcp comment 'rdp over the tailnet'
-          if [ "$ALLOW_SSH_FROM" = any ]; then
-            ufw allow in on eth0 to any port 22 proto tcp comment 'ssh (you asked for public ssh)'
-          else
-            ufw allow in on tailscale0 to any port 22 proto tcp comment 'ssh over the tailnet'
-            # Keep the session you are in right now alive: if this run arrived
-            # over the public interface, locking 22 to tailscale0 would cut you
-            # off mid-provision.
-            if [ -n "${SSH_CLIENT:-}" ]; then
-              SRC_IP="${SSH_CLIENT%% *}"
-              SRC_IF="$(ip route get "$SRC_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
-              if [ -n "${SRC_IF:-}" ] && [ "$SRC_IF" != tailscale0 ]; then
-                ufw allow in on "$SRC_IF" to any port 22 proto tcp comment "kept: your live ssh path ($SRC_IP)"
-                echo "  NOTE: port 22 stays reachable on $SRC_IF because you are connected there now."
-                echo "        Remove that rule once you have confirmed Tailscale SSH works."
-              fi
-            fi
-          fi
-          ufw --force enable
-
-          log "done"
-          cat <<EOF
-
-            RDP is up, and reachable ONLY at the tailnet address.
-
-              address   $TS_IP:3389
-              hostname  $TS_HOSTNAME
-              user      $DESKTOP_USER  ($( [ -n "${DESKTOP_PASSWORD_FILE:-}" ] && echo "password set from the staged file" || echo "no password set; run: sudo passwd $DESKTOP_USER" ))
-
-            From a device on the same tailnet:
-                mstsc /v:$TS_IP
-              or Remmina / FreeRDP:    rdp://$TS_IP
-
-            Left as your decision, deliberately not automated:
-             - fail2ban: unnecessary while 3389 is tail-only, required the moment
-               you widen it.
-             - the staged auth-key file: rotate the key in the Tailscale admin
-               console once you are in.
-          EOF
-          ROOT_SCRIPT
-          END_PROVISION
-
-      - name: Shred the staged key and password
-        # always() so a mid-provision failure still cleans up, but only once the
-        # files can exist - otherwise a mis-configured run adds a second ssh
-        # failure on top of the real error and hides it.
-        if: inputs.apply == 'apply' && always() && steps.ssh_prep.outcome == 'success'
+      - name: Show access info and keep alive
         run: |
-          set -euo pipefail
-          ssh -i "$RUNNER_TEMP/ssh/id_deploy" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" "$LAB_HOST_SSH" \
-            'set -e; for p in .tskey .tspw; do if [ -f "$HOME/$p.path" ]; then f="$(cat "$HOME/$p.path")"; shred -u -z -n 1 "$f" 2>/dev/null || rm -f "$f"; rm -f "$HOME/$p.path"; echo "removed $p"; else echo "nothing to remove for $p"; fi; done'
-
-      - name: Report only what is safe to read
-        if: inputs.apply == 'apply' && success()
-        run: |
-          set -euo pipefail
-          ssh -i "$RUNNER_TEMP/ssh/id_deploy" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
-              "$LAB_HOST_SSH" bash -s -- "$DESKTOP_USER" <<'END_VERIFY'
-          set -euo pipefail
-          DESKTOP_USER="$1"
-          echo "tailnet address: $(tailscale ip -4 2>/dev/null | head -n1)"
-          echo "xrdp service:    $(systemctl is-active xrdp)"
-          echo "listener check (3389 must be bound, and only reachable via the tail):"
-          ss -ltn | awk 'NR==1 || /:3389|:22/'
-          echo "firewall rules:"
-          sudo ufw status numbered | sed -n '1,40p'
-          echo
-          echo "Connect from a device on the same tailnet:  mstsc /v:$(tailscale ip -4 | head -n1)"
-          # `passwd -S` reports only the state (P / LK / NP), never the value.
-          echo "password state for $DESKTOP_USER: $(sudo passwd -S "$DESKTOP_USER" | awk '{print $2}')"
-          END_VERIFY
-
-      - name: What a dry-run did not do
-        if: inputs.apply == 'dry-run' && success()
-        run: |
-          echo "dry-run: read the host state only. No packages installed, no firewall"
-          echo "changed, no Tailscale node registered. Re-run with apply to provision."
+          echo "=============================="
+          echo "Address:  $TS_IP:3389"
+          echo "Username: rdpuser"
+          echo "Password: (আপনার RDP_PASSWORD secret)"
+          echo "=============================="
+          while true; do
+            echo "[$(date)] RDP active"
+            sleep 300
+          done
