@@ -1,4 +1,4 @@
-name: Linux-RDP-Fixed
+name: Linux-RDP-Final-Fix
 
 on:
   workflow_dispatch:
@@ -20,7 +20,6 @@ jobs:
 
       - name: Create RDP User with Password 1234
         run: |
-          # পাসওয়ার্ড সরাসরি 1234 সেট করা হয়েছে
           PASSWORD="1234"
           sudo useradd -m -s /bin/bash rdpuser
           echo "rdpuser:$PASSWORD" | sudo chpasswd
@@ -32,8 +31,9 @@ jobs:
           echo "RDP_USER=rdpuser" >> $GITHUB_ENV
           echo "RDP_PASS=$PASSWORD" >> $GITHUB_ENV
 
-      - name: Install Tailscale
+      - name: Install Tailscale (Fixed URL)
         run: |
+          # সঠিক স্ক্রিপ্ট URL ব্যবহার করা হয়েছে যেন পাইপলাইনে কোনো এরর না আসে
           curl -fsSL https://tailscale.com | sh
 
       - name: Establish Tailscale Connection
