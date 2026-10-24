@@ -35,8 +35,18 @@ jobs:
           # Set password to 1234
           echo "rdp:1234" | sudo chpasswd
           
-          # Configure XFCE Desktop session for user 'rdp'
-          echo "startxfce4" | sudo tee /home/rdp/.xsession >/dev/null
+          # Configure proper XFCE session with D-Bus environment
+          sudo bash -c 'cat << 'EOF' > /home/rdp/.xsession
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_CONFIG_DIRS=/etc/xdg
+          unset DBUS_SESSION_BUS_ADDRESS
+          if which dbus-launch >/dev/null; then
+              exec dbus-launch --exit-with-session startxfce4
+          else
+              exec startxfce4
+          fi
+          EOF'
+
           sudo chmod 755 /home/rdp/.xsession
           sudo chown rdp:rdp /home/rdp/.xsession
 
