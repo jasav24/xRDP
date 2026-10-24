@@ -40,21 +40,8 @@ jobs:
           sudo chmod 755 /home/rdp/.xsession
           sudo chown rdp:rdp /home/rdp/.xsession
 
-      - name: Configure and Start xrdp
+      - name: Start xrdp
         run: |
-          # Allow anyone to launch X server
-          sudo sed -i 's/allowed_users=console/allowed_users=anybody/g' /etc/X11/Xwrapper.config || true
-          
-          # Fix Polkit authentication prompt loop in XFCE
-          sudo bash -c 'cat <<EOF > /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla
-          [Allow Colord all Users]
-          Identity=unix-user:*
-          Action=org.freedesktop.color-manager.*;org.freedesktop.packagekit.*;org.freedesktop.realmd.*;org.freedesktop.policykit.*
-          ResultAny=no
-          ResultInactive=no
-          ResultActive=yes
-          EOF'
-
           sudo systemctl enable --now xrdp
           sudo systemctl restart xrdp
           sleep 2
