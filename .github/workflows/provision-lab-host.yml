@@ -8,46 +8,65 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
-    env:
-      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-
     steps:
-      - name: Check secrets
+      - name: Check Tailscale Secret
         run: |
-          [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
-          [ -n "$RDP_PASSWORD" ] || { echo "::error::RDP_PASSWORD missing"; exit 1; }
+          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
+            echo "::error::TAILSCALE_AUTH_KEY missing"
+            exit 1
+          fi
 
       - name: Install desktop and xrdp
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -q
           sudo apt-get install -yq --no-install-recommends \
-            xfce4 xfce4-terminal xorg xorgxrdp xrdp dbus-x11
+            xfce4 xfce4-terminal xorg xorgxrdp xrdp dbus-x11 ssl-cert
+          
+          # Fix xrdp group permissions
           sudo adduser xrdp ssl-cert || true
 
-      - name: Create RDP user
+      - name: Create RDP user and set password
         run: |
-          sudo useradd -m -s /bin/bash rdpuser
-          printf 'rdpuser:%s\n' "$RDP_PASSWORD" | sudo chpasswd
-          sudo usermod -aG sudo rdpuser
-          printf '#!/bin/sh\nexec startxfce4\n' | sudo tee /home/rdpuser/.xsession >/dev/null
-          sudo chmod 755 /home/rdpuser/.xsession
-          sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
+          # Create user 'rdp' if not exists
+          sudo useradd -m -s /bin/bash rdp || true
+          sudo usermod -aG sudo rdp
+          
+          # Set password to 1234
+          echo "rdp:1234" | sudo chpasswd
+          
+          # Configure XFCE Desktop session for user 'rdp'
+          echo "startxfce4" | sudo tee /home/rdp/.xsession >/dev/null
+          sudo chmod 755 /home/rdp/.xsession
+          sudo chown rdp:rdp /home/rdp/.xsession
 
-      - name: Start xrdp
+      - name: Configure and Start xrdp
         run: |
+          # Allow anyone to launch X server
+          sudo sed -i 's/allowed_users=console/allowed_users=anybody/g' /etc/X11/Xwrapper.config || true
+          
+          # Fix Polkit authentication prompt loop in XFCE
+          sudo bash -c 'cat <<EOF > /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla
+          [Allow Colord all Users]
+          Identity=unix-user:*
+          Action=org.freedesktop.color-manager.*;org.freedesktop.packagekit.*;org.freedesktop.realmd.*;org.freedesktop.policykit.*
+          ResultAny=no
+          ResultInactive=no
+          ResultActive=yes
+          EOF'
+
           sudo systemctl enable --now xrdp
           sudo systemctl restart xrdp
-          sleep 3
-          systemctl is-active xrdp
-          ss -ltn | grep 3389
+          sleep 2
+          sudo systemctl is-active xrdp
 
       - name: Connect Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey="$TS_AUTHKEY" \
+          sudo systemctl enable --now tailscaled
+          sudo tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
             --hostname="gh-linux-${GITHUB_RUN_ID}"
+          
           TS_IP=""
           for i in $(seq 1 12); do
             TS_IP="$(tailscale ip -4 | head -n1 || true)"
@@ -59,12 +78,15 @@ jobs:
 
       - name: Show access info and keep alive
         run: |
-          echo "=============================="
-          echo "Address:  $TS_IP"
-          echo "Username: rdpuser"
-          echo "Password: 1234"
-          echo "=============================="
+          echo "========================================="
+          echo " RDP Access Credentials"
+          echo "========================================="
+          echo " Address:  $TS_IP"
+          echo " Username: rdp"
+          echo " Password: 1234"
+          echo "========================================="
+          
           while true; do
-            echo "[$(date)] RDP active"
+            echo "[$(date)] RDP Session Active..."
             sleep 300
           done
