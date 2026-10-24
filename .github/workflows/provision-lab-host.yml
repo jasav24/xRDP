@@ -19,23 +19,42 @@ jobs:
           [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
 
       - name: Install Ubuntu GNOME desktop and xrdp
+        timeout-minutes: 25
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update -q
-          sudo apt-get install -yq \
+          export NEEDRESTART_MODE=a
+          export NEEDRESTART_SUSPEND=1
+
+          # ইনস্টলের সময় কোনো service অটো start/restart হবে না (ঝুলে যাওয়া এড়াতে)
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
+
+          sudo -E apt-get update -q
+
+          # আগে systemd আলাদা আপগ্রেড
+          sudo -E apt-get install -yq \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+            systemd systemd-sysv libsystemd0 udev || true
+
+          sudo -E apt-get install -yq --no-install-recommends \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
             ubuntu-desktop-minimal gnome-terminal \
             xorg xorgxrdp xrdp dbus-x11 ssl-cert
+
+          # service চালানোর অনুমতি ফেরত
+          sudo rm -f /usr/sbin/policy-rc.d
           sudo adduser xrdp ssl-cert || true
 
-          # gdm3 লাগবে না, xrdp নিজেই লগইন দেয়। ওটা চললে display দখল করে
-          sudo systemctl disable --now gdm3 2>/dev/null || true
+          # gdm3 লাগবে না, xrdp নিজেই লগইন দেয়
+          sudo systemctl disable gdm3 2>/dev/null || true
           sudo systemctl mask gdm3 2>/dev/null || true
 
           # xrdp-র Xorg চালাতে অনুমতি
           sudo mkdir -p /etc/X11
           printf 'allowed_users=anybody\nneeds_root_rights=yes\n' | sudo tee /etc/X11/Xwrapper.config >/dev/null
 
-          # বারবার "Authentication required" (color manager, packagekit) বন্ধ
+          # বারবার "Authentication required" প্রশ্ন বন্ধ
+          sudo mkdir -p /etc/polkit-1/rules.d
           sudo tee /etc/polkit-1/rules.d/45-allow-rdp.rules >/dev/null <<'EOF'
           polkit.addRule(function(action, subject) {
             if (action.id.indexOf("org.freedesktop.color-manager.") == 0 ||
@@ -90,9 +109,9 @@ jobs:
           echo "--- .xsession ---"
           cat "/home/$RDP_USER/.xsession"
           echo "--- gnome session files ---"
-          ls /usr/share/xsessions /usr/share/gnome-session/sessions 2>/dev/null
+          ls /usr/share/xsessions /usr/share/gnome-session/sessions 2>/dev/null || true
           echo "--- logind ---"
-          systemctl is-active systemd-logind
+          systemctl is-active systemd-logind || true
           sudo tail -n 20 /var/log/xrdp-sesman.log || true
 
       - name: Connect Tailscale
