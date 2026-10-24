@@ -26,7 +26,7 @@ jobs:
 
       - name: Create RDP user with random password
         run: |
-          PW="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-20)"
+          PW="1234"
           echo "RDP_PASSWORD=$PW" >> "$GITHUB_ENV"
           sudo useradd -m -s /bin/bash rdpuser
           printf 'rdpuser:%s\n' "$PW" | sudo chpasswd
