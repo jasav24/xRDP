@@ -8,60 +8,92 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
+    env:
+      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RDP_USER: rdp
+      RDP_PASSWORD: "1234"   # এখানে পছন্দের পাসওয়ার্ড বদলাতে পারবেন
+
     steps:
-      - name: Check Tailscale Secret
+      - name: Check Tailscale secret
         run: |
-          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
-            echo "::error::TAILSCALE_AUTH_KEY missing"
-            exit 1
-          fi
+          [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
 
       - name: Install MATE desktop and xrdp
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -q
           sudo apt-get install -yq --no-install-recommends \
-            mate-desktop-environment mate-core mate-terminal xorg xorgxrdp xrdp dbus-x11 ssl-cert
-          
-          # Fix xrdp group permissions
+            mate-desktop-environment mate-core mate-terminal \
+            xorg xorgxrdp xrdp dbus-x11 ssl-cert
           sudo adduser xrdp ssl-cert || true
 
-      - name: Create RDP user and set home directory correctly
+      - name: Create RDP user
         run: |
-          # Remove old 'rdp' user if exists to clean up corrupted home dirs
-          sudo userdel -r rdp || true
-          
-          # Create user 'rdp' with proper home directory at /home/rdp
-          sudo useradd -m -d /home/rdp -s /bin/bash rdp
-          sudo usermod -aG sudo rdp
-          
-          # Set password to 1234
-          echo "rdp:1234" | sudo chpasswd
-          
-          # Create config directories and set absolute ownership to 'rdp'
-          sudo mkdir -p /home/rdp/.config/caja
-          sudo chown -R rdp:rdp /home/rdp
-          sudo chmod -R 755 /home/rdp
-          
-          # Configure MATE desktop session for user 'rdp'
-          echo "mate-session" | sudo tee /home/rdp/.xsession >/dev/null
-          sudo chmod 755 /home/rdp/.xsession
-          sudo chown rdp:rdp /home/rdp/.xsession
+          # পুরোনো ইউজার ও ঝুলে থাকা সেশন পরিষ্কার
+          sudo pkill -u "$RDP_USER" || true
+          sudo userdel -r "$RDP_USER" 2>/dev/null || true
+
+          sudo useradd -m -d "/home/$RDP_USER" -s /bin/bash "$RDP_USER"
+          sudo usermod -aG sudo "$RDP_USER"
+          printf '%s:%s\n' "$RDP_USER" "$RDP_PASSWORD" | sudo chpasswd
+
+          # হোম ও কনফিগ ফোল্ডার, সঠিক মালিকানায়
+          sudo mkdir -p "/home/$RDP_USER/.config/caja" "/home/$RDP_USER/.cache" "/home/$RDP_USER/.local/share"
+          sudo chown -R "$RDP_USER:$RDP_USER" "/home/$RDP_USER"
+          sudo chmod 755 "/home/$RDP_USER"
+
+          # runner ইউজারের .config-ও ঠিক রাখি (ভুল ইউজারে ঢুকলেও caja error না আসে)
+          sudo mkdir -p /home/runner/.config/caja
+          sudo chown -R runner:runner /home/runner/.config /home/runner/.cache 2>/dev/null || true
+
+          # সেশন স্ক্রিপ্ট: HOME ও পরিবেশ স্পষ্টভাবে সেট
+          sudo tee "/home/$RDP_USER/.xsession" >/dev/null <<EOF
+          #!/bin/sh
+          export HOME=/home/$RDP_USER
+          export USER=$RDP_USER
+          export LOGNAME=$RDP_USER
+          export XDG_CONFIG_HOME=/home/$RDP_USER/.config
+          export XDG_CACHE_HOME=/home/$RDP_USER/.cache
+          export XDG_DATA_HOME=/home/$RDP_USER/.local/share
+          export XDG_CURRENT_DESKTOP=MATE
+          export DESKTOP_SESSION=mate
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          cd "\$HOME"
+          exec mate-session
+          EOF
+          sudo chmod 755 "/home/$RDP_USER/.xsession"
+          sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
 
       - name: Start xrdp
         run: |
           sudo systemctl enable --now xrdp
           sudo systemctl restart xrdp
-          sleep 2
-          sudo systemctl is-active xrdp
+          sleep 3
+          systemctl is-active xrdp
+          ss -ltn | grep 3389
+
+      - name: Debug user and permissions
+        run: |
+          echo "--- user ---"
+          id "$RDP_USER"
+          getent passwd "$RDP_USER"
+          sudo passwd -S "$RDP_USER"
+          echo "--- password length: ${#RDP_PASSWORD} ---"
+          echo "--- folders ---"
+          ls -ld "/home/$RDP_USER" "/home/$RDP_USER/.config" "/home/$RDP_USER/.config/caja" /home/runner/.config
+          echo "--- .xsession ---"
+          cat "/home/$RDP_USER/.xsession"
+          echo "--- xrdp logs ---"
+          sudo tail -n 20 /var/log/xrdp-sesman.log || true
+          sudo tail -n 20 /var/log/xrdp.log || true
 
       - name: Connect Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo systemctl enable --now tailscaled
-          sudo tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+          sudo tailscale up --authkey="$TS_AUTHKEY" \
             --hostname="gh-linux-${GITHUB_RUN_ID}"
-          
           TS_IP=""
           for i in $(seq 1 12); do
             TS_IP="$(tailscale ip -4 | head -n1 || true)"
@@ -74,14 +106,12 @@ jobs:
       - name: Show access info and keep alive
         run: |
           echo "========================================="
-          echo " RDP Access Credentials"
-          echo "========================================="
           echo " Address:  $TS_IP"
-          echo " Username: rdp"
-          echo " Password: 1234"
+          echo " Username: $RDP_USER"
+          echo " Password: $RDP_PASSWORD"
           echo "========================================="
-          
           while true; do
-            echo "[$(date)] RDP Session Active..."
+            echo "[$(date)] RDP active. Running desktop sessions:"
+            ps -eo user,pid,cmd | grep -E "mate-session|Xorg|xrdp-sesman" | grep -v grep || echo "  (no session yet)"
             sleep 300
           done
