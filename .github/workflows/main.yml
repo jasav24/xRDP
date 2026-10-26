@@ -18,13 +18,26 @@ jobs:
         run: |
           [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
 
-      # ১. Rclone ইনস্টল ও কনফিগার করা (TeraBox ব্যাকআপের জন্য)
-      - name: Setup Rclone
-        uses: AnimMouse/setup-rclone@v1
-        with:
-          rclone_config: ${{ secrets.RCLONE_CONF }}
+      # ১. TeraBox সাপোর্টসহ কাস্টম Rclone ইনস্টল ও কনফিগার করা
+      - name: Setup Custom Rclone for TeraBox
+        run: |
+          echo "Downloading custom rclone with TeraBox support..."
+          curl -L -o rclone-extra.zip https://github.com/gulp79/rclone-extra/releases/latest/download/rclone-linux-amd64.zip
+          unzip -q rclone-extra.zip
+          
+          RCLONE_BIN=$(find . -name "rclone" -type f)
+          sudo cp $RCLONE_BIN /usr/local/bin/rclone
+          sudo chmod +x /usr/local/bin/rclone
+          
+          mkdir -p $HOME/.config/rclone
+          cat << 'EOF' > $HOME/.config/rclone/rclone.conf
+          ${{ secrets.RCLONE_CONF }}
+          EOF
+          
+          echo "Rclone configured successfully!"
+          rclone version
 
-      # ২. ক্লাউড ড্রাইভ (TeraBox) থেকে ক্রোমিয়াম বা প্রজেক্টের পুরোনো সোর্স ও ক্যাশ রিস্টোর করা
+      # ২. ক্লাউড ড্রাইভ (TeraBox) থেকে ক্রোমিয়াম বা প্রজেক্টের পুরোনো সোর্স ও ক্যাশ রিস্টোর করা
       - name: Restore Chromium Source & Cache
         run: |
           echo "Restoring cache from TeraBox..."
@@ -106,7 +119,6 @@ jobs:
           sudo chmod 755 "/home/$RDP_USER/.xsession"
           sudo chown -R "$RDP_USER:$RDP_USER" "/home/$RDP_USER"
 
-          # ক্রোমিয়াম প্রজেক্ট ফোল্ডারটি রডিপি ইউজারের আন্ডারে দিয়ে দেওয়া যাতে তিনি বিল্ড করতে পারেন
           sudo mkdir -p /home/$RDP_USER/chromium
           sudo cp -r /home/runner/chromium/* /home/$RDP_USER/chromium/ 2>/dev/null || true
           sudo chown -R "$RDP_USER:$RDP_USER" /home/$RDP_USER/chromium
@@ -142,7 +154,6 @@ jobs:
           echo " Password: $RDP_PASSWORD"
           echo "========================================="
 
-      # ৩. কাজ শেষে বা সেশন চলাকালীন সময় ব্যাকআপ নেওয়ার জন্য ব্যাকগ্রাউন্ড স্ক্রিপ্ট অথবা অলওয়েজ ব্লক
       - name: Backup Source & Cache to Cloud (Always run on finish/timeout)
         if: always()
         run: |
