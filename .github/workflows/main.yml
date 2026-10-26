@@ -107,20 +107,25 @@ jobs:
           sudo mkdir -p "/home/$RDP_USER/.config" "/home/$RDP_USER/.cache" "/home/$RDP_USER/.local/share"
           echo "yes" | sudo tee "/home/$RDP_USER/.config/gnome-initial-setup-done" >/dev/null
 
-          # Black screen রোধ করার জন্য কাস্টম সেশন হ্যান্ডলার
+          # Black screen fix: xrdp-sesman inherits the Actions runner env when it is
+          # started from a job step, so the session could get XDG_CONFIG_HOME=/home/runner/.config
+          # (unreadable) and two competing session buses. Pin every XDG var to the RDP user
+          # and let dbus-run-session own the only bus.
           sudo tee "/home/$RDP_USER/.xsession" >/dev/null <<'EOF'
           #!/bin/sh
+          unset DBUS_SESSION_BUS_ADDRESS
           export XDG_SESSION_TYPE=x11
           export GDK_BACKEND=x11
           export XDG_CURRENT_DESKTOP=ubuntu:GNOME
           export GNOME_SHELL_SESSION_MODE=ubuntu
           export XDG_CONFIG_DIRS=/etc/xdg/xdg-ubuntu:/etc/xdg
           export XDG_DATA_DIRS=/usr/share/ubuntu:/usr/local/share:/usr/share:/var/lib/snapd/desktop
-          
-          if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
-              eval $(dbus-launch --sh-syntax --exit-with-session)
-          fi
-          
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          mkdir -p "$XDG_CONFIG_HOME/dconf" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
           exec dbus-run-session -- gnome-session --session=ubuntu
           EOF
           
@@ -134,10 +139,12 @@ jobs:
       # ৫. XRDP চালু করা
       - name: Start xrdp
         run: |
-          sudo systemctl enable --now xrdp xrdp-sesman
-          sudo systemctl restart xrdp
+          sudo systemctl enable xrdp xrdp-sesman
+          # env -i: don't hand the job's environment to sesman, it leaks into every session
+          sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            systemctl restart xrdp xrdp-sesman
           sleep 3
-          systemctl is-active xrdp
+          systemctl is-active xrdp xrdp-sesman
           ss -ltn | grep 3389
 
       # ৬. Tailscale কানেক্ট করা
