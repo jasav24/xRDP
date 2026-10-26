@@ -1,0 +1,155 @@
+name: RDP-Linux-GNOME & Chromium Build Environment
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RDP_USER: rdp
+      RDP_PASSWORD: "1234"   # পছন্দমতো বদলাতে পারবেন
+
+    steps:
+      - name: Check Tailscale secret
+        run: |
+          [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
+
+      # ১. Rclone ইনস্টল ও কনফিগার করা (TeraBox ব্যাকআপের জন্য)
+      - name: Setup Rclone
+        uses: AnimMouse/setup-rclone@v1
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONF }}
+
+      # ২. ক্লাউড ড্রাইভ (TeraBox) থেকে ক্রোমিয়াম বা প্রজেক্টের পুরোনো সোর্স ও ক্যাশ রিস্টোর করা
+      - name: Restore Chromium Source & Cache
+        run: |
+          echo "Restoring cache from TeraBox..."
+          mkdir -p /home/runner/chromium
+          rclone copy terabox:ChromiumBackup/chromium_cache.zip /home/runner/chromium/ --progress || true
+          
+          if [ -f "/home/runner/chromium/chromium_cache.zip" ]; then
+            echo "Extracting files..."
+            mkdir -p /home/runner/chromium/src
+            unzip -q /home/runner/chromium/chromium_cache.zip -d /home/runner/chromium/src
+          else
+            echo "No previous backup found. Starting fresh."
+          fi
+
+      - name: Install Ubuntu GNOME desktop and xrdp
+        timeout-minutes: 25
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          export NEEDRESTART_MODE=a
+          export NEEDRESTART_SUSPEND=1
+
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
+
+          sudo -E apt-get update -q
+
+          sudo -E apt-get install -yq \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+            systemd systemd-sysv libsystemd0 udev || true
+
+          sudo -E apt-get install -yq --no-install-recommends \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+            ubuntu-desktop-minimal gnome-terminal \
+            xorg xorgxrdp xrdp dbus-x11 ssl-cert unzip zip curl
+
+          sudo rm -f /usr/sbin/policy-rc.d
+          sudo adduser xrdp ssl-cert || true
+
+          sudo systemctl disable gdm3 2>/dev/null || true
+          sudo systemctl mask gdm3 2>/dev/null || true
+
+          sudo mkdir -p /etc/X11
+          printf 'allowed_users=anybody\nneeds_root_rights=yes\n' | sudo tee /etc/X11/Xwrapper.config >/dev/null
+
+          sudo mkdir -p /etc/polkit-1/rules.d
+          sudo tee /etc/polkit-1/rules.d/45-allow-rdp.rules >/dev/null <<'EOF'
+          polkit.addRule(function(action, subject) {
+            if (action.id.indexOf("org.freedesktop.color-manager.") == 0 ||
+                action.id.indexOf("org.freedesktop.packagekit.") == 0 ||
+                action.id.indexOf("org.freedesktop.login1.") == 0) {
+              return polkit.Result.YES;
+            }
+          });
+          EOF
+
+      - name: Create RDP user and set permissions for chromium workspace
+        run: |
+          sudo pkill -u "$RDP_USER" || true
+          sudo userdel -r "$RDP_USER" 2>/dev/null || true
+
+          sudo useradd -m -d "/home/$RDP_USER" -s /bin/bash "$RDP_USER"
+          sudo usermod -aG sudo "$RDP_USER"
+          printf '%s:%s\n' "$RDP_USER" "$RDP_PASSWORD" | sudo chpasswd
+
+          sudo mkdir -p "/home/$RDP_USER/.config" "/home/$RDP_USER/.cache" "/home/$RDP_USER/.local/share"
+          echo "yes" | sudo tee "/home/$RDP_USER/.config/gnome-initial-setup-done" >/dev/null
+
+          sudo tee "/home/$RDP_USER/.xsession" >/dev/null <<EOF
+          #!/bin/sh
+          export XDG_SESSION_TYPE=x11
+          export GDK_BACKEND=x11
+          export XDG_CURRENT_DESKTOP=ubuntu:GNOME
+          export GNOME_SHELL_SESSION_MODE=ubuntu
+          export XDG_CONFIG_DIRS=/etc/xdg/xdg-ubuntu:/etc/xdg
+          export XDG_DATA_DIRS=/usr/share/ubuntu:/usr/local/share:/usr/share:/var/lib/snapd/desktop
+          cd "\$HOME"
+          exec gnome-session --session=ubuntu
+          EOF
+          sudo chmod 755 "/home/$RDP_USER/.xsession"
+          sudo chown -R "$RDP_USER:$RDP_USER" "/home/$RDP_USER"
+
+          # ক্রোমিয়াম প্রজেক্ট ফোল্ডারটি রডিপি ইউজারের আন্ডারে দিয়ে দেওয়া যাতে তিনি বিল্ড করতে পারেন
+          sudo mkdir -p /home/$RDP_USER/chromium
+          sudo cp -r /home/runner/chromium/* /home/$RDP_USER/chromium/ 2>/dev/null || true
+          sudo chown -R "$RDP_USER:$RDP_USER" /home/$RDP_USER/chromium
+
+      - name: Start xrdp
+        run: |
+          sudo systemctl enable --now xrdp xrdp-sesman
+          sudo systemctl restart xrdp
+          sleep 3
+          systemctl is-active xrdp
+          ss -ltn | grep 3389
+
+      - name: Connect Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+          sudo tailscale up --authkey="$TS_AUTHKEY" \
+            --hostname="gh-gnome-${GITHUB_RUN_ID}"
+          TS_IP=""
+          for i in $(seq 1 12); do
+            TS_IP="$(tailscale ip -4 | head -n1 || true)"
+            [ -n "$TS_IP" ] && break
+            sleep 5
+          done
+          [ -n "$TS_IP" ] || { echo "::error::no Tailscale IP"; exit 1; }
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+
+      - name: Show access info and keep alive
+        run: |
+          echo "========================================="
+          echo " Address:  $TS_IP"
+          echo " Username: $RDP_USER"
+          echo " Password: $RDP_PASSWORD"
+          echo "========================================="
+
+      # ৩. কাজ শেষে বা সেশন চলাকালীন সময় ব্যাকআপ নেওয়ার জন্য ব্যাকগ্রাউন্ড স্ক্রিপ্ট অথবা অলওয়েজ ব্লক
+      - name: Backup Source & Cache to Cloud (Always run on finish/timeout)
+        if: always()
+        run: |
+          echo "Compressing files for TeraBox backup..."
+          sudo zip -r -q /tmp/chromium_cache.zip /home/$RDP_USER/chromium/src/ || true
+          
+          echo "Uploading to TeraBox..."
+          rclone copy /tmp/chromium_cache.zip terabox:ChromiumBackup/ --progress || true
+          echo "Backup uploaded successfully!"
+          
