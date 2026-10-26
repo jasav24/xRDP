@@ -37,7 +37,7 @@ jobs:
           echo "Rclone configured successfully!"
           rclone version
 
-      # ২. ক্লাউড ড্রাইভ (TeraBox) থেকে ক্রোমিয়াম বা প্রজেক্টের পুরোনো সোর্স ও ক্যাশ রিস্টোর করা
+      # ২. TeraBox থেকে সোর্স কোড ও ক্যাশ রিস্টোর
       - name: Restore Chromium Source & Cache
         run: |
           echo "Restoring cache from TeraBox..."
@@ -52,6 +52,7 @@ jobs:
             echo "No previous backup found. Starting fresh."
           fi
 
+      # ৩. Ubuntu GNOME Desktop & XRDP ইনস্টলেশন
       - name: Install Ubuntu GNOME desktop and xrdp
         timeout-minutes: 25
         run: |
@@ -93,6 +94,7 @@ jobs:
           });
           EOF
 
+      # ৪. RDP ইউজার তৈরি ও পারমিশন প্রদান
       - name: Create RDP user and set permissions for chromium workspace
         run: |
           sudo pkill -u "$RDP_USER" || true
@@ -114,7 +116,7 @@ jobs:
           export XDG_CONFIG_DIRS=/etc/xdg/xdg-ubuntu:/etc/xdg
           export XDG_DATA_DIRS=/usr/share/ubuntu:/usr/local/share:/usr/share:/var/lib/snapd/desktop
           cd "\$HOME"
-          exec gnome-session --session=ubuntu
+          exec dbus-run-session -- gnome-session --session=ubuntu
           EOF
           sudo chmod 755 "/home/$RDP_USER/.xsession"
           sudo chown -R "$RDP_USER:$RDP_USER" "/home/$RDP_USER"
@@ -123,6 +125,7 @@ jobs:
           sudo cp -r /home/runner/chromium/* /home/$RDP_USER/chromium/ 2>/dev/null || true
           sudo chown -R "$RDP_USER:$RDP_USER" /home/$RDP_USER/chromium
 
+      # ৫. XRDP চালু করা
       - name: Start xrdp
         run: |
           sudo systemctl enable --now xrdp xrdp-sesman
@@ -131,6 +134,7 @@ jobs:
           systemctl is-active xrdp
           ss -ltn | grep 3389
 
+      # ৬. Tailscale কানেক্ট করা
       - name: Connect Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -146,20 +150,40 @@ jobs:
           [ -n "$TS_IP" ] || { echo "::error::no Tailscale IP"; exit 1; }
           echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
 
-      - name: Show access info and keep alive
+      # ৭. রিমোট সেশন চালু রাখা এবং প্রতি ৩০ মিনিটে অটো-ব্যাকআপ চালানো
+      - name: Show access info and start 30-min auto backup loop
         run: |
           echo "========================================="
           echo " Address:  $TS_IP"
           echo " Username: $RDP_USER"
           echo " Password: $RDP_PASSWORD"
+          echo " Auto-backup Interval: Every 30 minutes"
           echo "========================================="
+          
+          # লুপ চালু রাখা এবং ৩০ মিনিট (১৮০০ সেকেন্ড) পরপর ব্যাকআপ নেওয়া
+          while true; do
+            echo "[$(date)] Waiting 30 minutes before next auto-backup..."
+            sleep 1800
+            
+            echo "[$(date)] Running 30-minute periodic backup to TeraBox..."
+            if [ -d "/home/$RDP_USER/chromium" ] && [ "$(ls -A /home/$RDP_USER/chromium)" ]; then
+              sudo zip -r -q /tmp/chromium_cache.zip /home/$RDP_USER/chromium/ || true
+              rclone copy /tmp/chromium_cache.zip terabox:ChromiumBackup/ --progress || true
+              echo "[$(date)] Periodic backup completed successfully!"
+            else
+              echo "[$(date)] No files found to backup. Skipping."
+            fi
+          done
 
-      - name: Backup Source & Cache to Cloud (Always run on finish/timeout)
+      # ৮. সেশন ম্যানুয়ালি বা টাইমআউটে শেষ হলেও ফাইনাল ব্যাকআপ নেওয়া
+      - name: Final Backup on Workflow Exit
         if: always()
         run: |
-          echo "Compressing files for TeraBox backup..."
-          sudo zip -r -q /tmp/chromium_cache.zip /home/$RDP_USER/chromium/src/ || true
-          
-          echo "Uploading to TeraBox..."
-          rclone copy /tmp/chromium_cache.zip terabox:ChromiumBackup/ --progress || true
-          echo "Backup uploaded successfully!"
+          echo "[$(date)] Running final exit backup to TeraBox..."
+          if [ -d "/home/$RDP_USER/chromium" ] && [ "$(ls -A /home/$RDP_USER/chromium)" ]; then
+            sudo zip -r -q /tmp/chromium_cache.zip /home/$RDP_USER/chromium/ || true
+            rclone copy /tmp/chromium_cache.zip terabox:ChromiumBackup/ --progress || true
+            echo "[$(date)] Final backup completed!"
+          else
+            echo "No files found for final backup."
+          fi
