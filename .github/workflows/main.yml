@@ -11,14 +11,14 @@ jobs:
     env:
       TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       RDP_USER: rdp
-      RDP_PASSWORD: "1234"   # পছন্দমতো বদলাতে পারবেন
+      RDP_PASSWORD: "1234"   # pochhondomoto bodlate parben
 
     steps:
       - name: Check Tailscale secret
         run: |
           [ -n "$TS_AUTHKEY" ] || { echo "::error::TAILSCALE_AUTH_KEY missing"; exit 1; }
 
-      # ১. TeraBox সাপোর্টসহ কাস্টম Rclone ইনস্টল ও কনফিগার করা
+      # ১. TeraBox shohogotay custom rclone install ebong configure kora
       - name: Setup Custom Rclone for TeraBox
         run: |
           echo "Downloading custom rclone with TeraBox support..."
@@ -37,7 +37,7 @@ jobs:
           echo "Rclone configured successfully!"
           rclone version
 
-      # ২. TeraBox থেকে সোর্স কোড ও ক্যাশ রিস্টোর
+      # ২. TeraBox theke source code ebong cache restore kora
       - name: Restore Chromium Source & Cache
         run: |
           echo "Restoring cache from TeraBox..."
@@ -52,7 +52,7 @@ jobs:
             echo "No previous backup found. Starting fresh."
           fi
 
-      # ৩. Ubuntu GNOME Desktop & XRDP ইনস্টলেশন
+      # ৩. Ubuntu GNOME Desktop & XRDP installation
       - name: Install Ubuntu GNOME desktop and xrdp
         timeout-minutes: 25
         run: |
@@ -94,7 +94,7 @@ jobs:
           });
           EOF
 
-      # ৪. RDP ইউজার তৈরি ও পারমিশন প্রদান (Black Screen Fix সহ)
+      # ৪. RDP user toiri ebong permissions thik kora (Black Screen Fix shoho)
       - name: Create RDP user and set permissions for chromium workspace
         run: |
           sudo pkill -u "$RDP_USER" || true
@@ -107,10 +107,6 @@ jobs:
           sudo mkdir -p "/home/$RDP_USER/.config" "/home/$RDP_USER/.cache" "/home/$RDP_USER/.local/share"
           echo "yes" | sudo tee "/home/$RDP_USER/.config/gnome-initial-setup-done" >/dev/null
 
-          # Black screen fix: xrdp-sesman inherits the Actions runner env when it is
-          # started from a job step, so the session could get XDG_CONFIG_HOME=/home/runner/.config
-          # (unreadable) and two competing session buses. Pin every XDG var to the RDP user
-          # and let dbus-run-session own the only bus.
           sudo tee "/home/$RDP_USER/.xsession" >/dev/null <<'EOF'
           #!/bin/sh
           unset DBUS_SESSION_BUS_ADDRESS
@@ -136,18 +132,17 @@ jobs:
           sudo cp -r /home/runner/chromium/* /home/$RDP_USER/chromium/ 2>/dev/null || true
           sudo chown -R "$RDP_USER:$RDP_USER" /home/$RDP_USER/chromium
 
-      # ৫. XRDP চালু করা
+      # ৫. XRDP service start kora
       - name: Start xrdp
         run: |
           sudo systemctl enable xrdp xrdp-sesman
-          # env -i: don't hand the job's environment to sesman, it leaks into every session
           sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             systemctl restart xrdp xrdp-sesman
           sleep 3
           systemctl is-active xrdp xrdp-sesman
           ss -ltn | grep 3389
 
-      # ৬. Tailscale কানেক্ট করা
+      # ৬. Tailscale connect kora
       - name: Connect Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -163,7 +158,7 @@ jobs:
           [ -n "$TS_IP" ] || { echo "::error::no Tailscale IP"; exit 1; }
           echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
 
-      # ৭. রিমোট সেশন চালু রাখা এবং প্রতি ৩০ মিনিটে অটো-ব্যাকআপ চালানো
+      # ৭. Session active rakha ebong proti 30 minute-er auto-backup loop cholbe
       - name: Show access info and start 30-min auto backup loop
         run: |
           echo "========================================="
@@ -173,7 +168,6 @@ jobs:
           echo " Auto-backup Interval: Every 30 minutes"
           echo "========================================="
           
-          # সেশন বজায় রাখা এবং প্রতি ৩০ মিনিট (১৮০০ সেকেন্ড) পর পর ব্যাকআপ নেওয়া
           while true; do
             echo "[$(date)] Waiting 30 minutes before next auto-backup..."
             sleep 1800
@@ -188,7 +182,7 @@ jobs:
             fi
           done
 
-      # ৮. সেশন ম্যানুয়ালি বা টাইমআউটে শেষ হলেও ফাইনাল ব্যাকআপ নেওয়া
+      # ৮. Session sesh hole ba cancel korle final backup nibe
       - name: Final Backup on Workflow Exit
         if: always()
         run: |
