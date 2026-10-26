@@ -94,7 +94,7 @@ jobs:
           });
           EOF
 
-      # ৪. RDP ইউজার তৈরি ও পারমিশন প্রদান
+      # ৪. RDP ইউজার তৈরি ও পারমিশন প্রদান (Black Screen Fix সহ)
       - name: Create RDP user and set permissions for chromium workspace
         run: |
           sudo pkill -u "$RDP_USER" || true
@@ -107,7 +107,8 @@ jobs:
           sudo mkdir -p "/home/$RDP_USER/.config" "/home/$RDP_USER/.cache" "/home/$RDP_USER/.local/share"
           echo "yes" | sudo tee "/home/$RDP_USER/.config/gnome-initial-setup-done" >/dev/null
 
-          sudo tee "/home/$RDP_USER/.xsession" >/dev/null <<EOF
+          # Black screen রোধ করার জন্য কাস্টম সেশন হ্যান্ডলার
+          sudo tee "/home/$RDP_USER/.xsession" >/dev/null <<'EOF'
           #!/bin/sh
           export XDG_SESSION_TYPE=x11
           export GDK_BACKEND=x11
@@ -115,9 +116,14 @@ jobs:
           export GNOME_SHELL_SESSION_MODE=ubuntu
           export XDG_CONFIG_DIRS=/etc/xdg/xdg-ubuntu:/etc/xdg
           export XDG_DATA_DIRS=/usr/share/ubuntu:/usr/local/share:/usr/share:/var/lib/snapd/desktop
-          cd "\$HOME"
+          
+          if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+              eval $(dbus-launch --sh-syntax --exit-with-session)
+          fi
+          
           exec dbus-run-session -- gnome-session --session=ubuntu
           EOF
+          
           sudo chmod 755 "/home/$RDP_USER/.xsession"
           sudo chown -R "$RDP_USER:$RDP_USER" "/home/$RDP_USER"
 
@@ -160,7 +166,7 @@ jobs:
           echo " Auto-backup Interval: Every 30 minutes"
           echo "========================================="
           
-          # লুপ চালু রাখা এবং ৩০ মিনিট (১৮০০ সেকেন্ড) পরপর ব্যাকআপ নেওয়া
+          # সেশন বজায় রাখা এবং প্রতি ৩০ মিনিট (১৮০০ সেকেন্ড) পর পর ব্যাকআপ নেওয়া
           while true; do
             echo "[$(date)] Waiting 30 minutes before next auto-backup..."
             sleep 1800
@@ -175,7 +181,7 @@ jobs:
             fi
           done
 
-      # ৮. সেশন ম্যানুয়ালি বা টাইমআউটে শেষ হলেও ফাইনাল ব্যাকআপ নেওয়া
+      # ৮. সেশন ম্যানুয়ালি বা টাইমআউটে শেষ হলেও ফাইনাল ব্যাকআপ নেওয়া
       - name: Final Backup on Workflow Exit
         if: always()
         run: |
